@@ -24,7 +24,6 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
-
 # ---------------------------------------------------------------------------
 # PyCharm Run-button configuration
 # ---------------------------------------------------------------------------
@@ -59,8 +58,13 @@ LEGACY_PROJECT_COLUMNS: dict[str, tuple[str, ...]] = {
     "project_parameter": ("project_id",),
     "project_parameter_attachments": ("project_id",),
     "project_r_parameter": ("project_id",),
+    "project_r_parameter_history": ("project_id",),
     "project_r_parameter_manager_approval_history": ("project_id",),
     "project_statement": ("project_id",),
+    "project_se_confirmation_history": ("project_id",),
+    "project_se_input_completion": ("project_id",),
+    "project_se_notification": ("project_id",),
+    "project_se_notification_target": ("project_id",),
     "project_summary": ("project_id",),
     "rfl_order": ("project_id",),
     "rfl_to_description": ("project_info_id",),
@@ -74,6 +78,16 @@ LEGACY_PROJECT_COLUMNS: dict[str, tuple[str, ...]] = {
     "test_project_senario_parameter": ("project_id",),
     "test_senario_parameter_map_relation": ("project_id",),
     "wp_statement": ("project_id",),
+}
+
+# Reviewed backup/recovery snapshots. Their historical project IDs are kept.
+IGNORED_SNAPSHOT_PROJECT_COLUMNS: dict[str, tuple[str, ...]] = {
+    "bk_prj_rfl_20260901": ("project_info_id",),
+    "bk_project_parameter_20260901": ("project_id",),
+    "bk_project_r_parameter_20260901": ("project_id",),
+    "zz_oos_pp": ("project_id",),
+    "zz_oos_prp": ("project_id",),
+    "zz_oos_rfl": ("project_info_id",),
 }
 
 CANDIDATE_COLUMN_NAMES = ("project_id", "project_info_id")
@@ -129,15 +143,12 @@ class MergePlan:
     references: tuple[Reference, ...]
     unique_checks: tuple[UniqueCheck, ...]
     unreviewed_candidates: tuple[Candidate, ...]
+    ignored_snapshots: tuple[Candidate, ...] = ()
     snapshots: tuple[TableSnapshot, ...] = ()
 
     @property
     def blockers(self) -> tuple[str, ...]:
         blockers: list[str] = []
-        if self.project_differences:
-            blockers.append(
-                "Hai dòng project_info khác nhau; không thể xác nhận đây là bản ghi trùng."
-            )
         for check in self.unique_checks:
             if check.conflict_groups is None:
                 blockers.append(
@@ -172,9 +183,9 @@ class MergePlan:
                 for c in self.unique_checks
             ),
             tuple(
-                (c.table, c.column, c.source_rows)
-                for c in self.unreviewed_candidates
+                (c.table, c.column, c.source_rows) for c in self.unreviewed_candidates
             ),
+            tuple((c.table, c.column, c.source_rows) for c in self.ignored_snapshots),
         )
 
 
@@ -367,11 +378,12 @@ def build_references(
     )
 
 
-def discover_unreviewed_candidates(
+def discover_candidates(
     cursor,
     reviewed_pairs: set[tuple[str, str]],
+    ignored_snapshot_pairs: set[tuple[str, str]],
     source_id: int,
-) -> tuple[Candidate, ...]:
+) -> tuple[tuple[Candidate, ...], tuple[Candidate, ...]]:
     cursor.execute(
         f"""
         SELECT c.TABLE_NAME, c.COLUMN_NAME
@@ -387,17 +399,24 @@ def discover_unreviewed_candidates(
         """,
         [*CANDIDATE_COLUMN_NAMES, PROJECT_TABLE],
     )
-    candidates: list[Candidate] = []
+    unreviewed: list[Candidate] = []
+    ignored_snapshots: list[Candidate] = []
     for table, column in cursor.fetchall():
         pair = (str(table), str(column))
         if pair not in reviewed_pairs:
-            candidates.append(
-                Candidate(pair[0], pair[1], count_value(cursor, *pair, source_id))
+            candidate = Candidate(
+                pair[0], pair[1], count_value(cursor, *pair, source_id)
             )
-    return tuple(candidates)
+            if pair in ignored_snapshot_pairs:
+                ignored_snapshots.append(candidate)
+            else:
+                unreviewed.append(candidate)
+    return tuple(unreviewed), tuple(ignored_snapshots)
 
 
-def unique_indexes(cursor, table: str) -> dict[str, list[tuple[str | None, int | None]]]:
+def unique_indexes(
+    cursor, table: str
+) -> dict[str, list[tuple[str | None, int | None]]]:
     cursor.execute(
         """
         SELECT INDEX_NAME, COLUMN_NAME, SUB_PART
@@ -433,7 +452,9 @@ def count_unique_conflict_groups(
     for position, column in enumerate(index_columns, start=1):
         identifier = quote_identifier(column)
         if column in project_columns:
-            select_parts.append(f"IF({identifier} = %s, %s, {identifier}) AS k{position}")
+            select_parts.append(
+                f"IF({identifier} = %s, %s, {identifier}) AS k{position}"
+            )
             params.extend([source_id, target_id])
         else:
             select_parts.append(f"{identifier} AS k{position}")
@@ -450,7 +471,7 @@ def count_unique_conflict_groups(
         FROM (
             SELECT {grouped_columns}
             FROM (
-                SELECT {', '.join(select_parts)},
+                SELECT {", ".join(select_parts)},
                        IF({source_predicate}, 1, 0) AS source_marker
                 FROM {quote_identifier(table)}
             ) AS mapped_rows
@@ -514,9 +535,7 @@ def build_unique_checks(
                 source_id,
                 target_id,
             )
-            checks.append(
-                UniqueCheck(table, index_name, columns, conflicts)
-            )
+            checks.append(UniqueCheck(table, index_name, columns, conflicts))
     return tuple(checks)
 
 
@@ -573,6 +592,14 @@ def build_plan(
     target_project = fetch_project(cursor, target_id, lock=lock_projects)
     discovered = discover_references(cursor)
     references = build_references(cursor, discovered, source_id, target_id)
+    ignored_snapshot_pairs = {
+        (table, column)
+        for table, columns in IGNORED_SNAPSHOT_PROJECT_COLUMNS.items()
+        for column in columns
+    }
+    unreviewed_candidates, ignored_snapshots = discover_candidates(
+        cursor, set(discovered), ignored_snapshot_pairs, source_id
+    )
     plan = MergePlan(
         source_id=source_id,
         target_id=target_id,
@@ -581,9 +608,8 @@ def build_plan(
         project_differences=compare_projects(source_project, target_project),
         references=references,
         unique_checks=build_unique_checks(cursor, references, source_id, target_id),
-        unreviewed_candidates=discover_unreviewed_candidates(
-            cursor, set(discovered), source_id
-        ),
+        unreviewed_candidates=unreviewed_candidates,
+        ignored_snapshots=ignored_snapshots,
     )
     if include_snapshots:
         plan.snapshots = snapshot_tables(cursor, references, source_id, row_limit)
@@ -602,16 +628,9 @@ def update_table_references(
         f"{quote_identifier(column)})"
         for column in columns
     )
-    predicate = " OR ".join(
-        f"{quote_identifier(column)} = %s" for column in columns
-    )
+    predicate = " OR ".join(f"{quote_identifier(column)} = %s" for column in columns)
     count_params = [source_id] * len(columns)
-    cursor.execute(
-        f"SELECT COUNT(*) FROM {quote_identifier(table)} "
-        f"WHERE {predicate} FOR UPDATE",
-        count_params,
-    )
-    expected = int(cursor.fetchone()[0])
+    expected = count_table_reference_rows(cursor, table, columns, source_id, lock=True)
     update_params: list[int] = []
     for _ in columns:
         update_params.extend([source_id, target_id])
@@ -628,20 +647,104 @@ def update_table_references(
     return actual
 
 
+def count_table_reference_rows(
+    cursor,
+    table: str,
+    columns: Sequence[str],
+    source_id: int,
+    *,
+    lock: bool = False,
+) -> int:
+    predicate = " OR ".join(f"{quote_identifier(column)} = %s" for column in columns)
+    lock_sql = " FOR UPDATE" if lock else ""
+    cursor.execute(
+        f"SELECT COUNT(*) FROM {quote_identifier(table)} WHERE {predicate}{lock_sql}",
+        [source_id] * len(columns),
+    )
+    return int(cursor.fetchone()[0])
+
+
+def discover_cascade_update_dependencies(
+    cursor, tables: Sequence[str]
+) -> tuple[tuple[str, str], ...]:
+    """Return parent/child table pairs whose project key updates cascade."""
+    ordered_tables = sorted(set(tables))
+    if not ordered_tables:
+        return ()
+    placeholders = make_placeholders(ordered_tables)
+    cursor.execute(
+        f"""
+        SELECT DISTINCT kcu.REFERENCED_TABLE_NAME, kcu.TABLE_NAME
+        FROM information_schema.KEY_COLUMN_USAGE AS kcu
+        JOIN information_schema.REFERENTIAL_CONSTRAINTS AS rc
+          ON rc.CONSTRAINT_SCHEMA = kcu.CONSTRAINT_SCHEMA
+         AND rc.TABLE_NAME = kcu.TABLE_NAME
+         AND rc.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME
+        WHERE kcu.TABLE_SCHEMA = DATABASE()
+          AND kcu.TABLE_NAME IN ({placeholders})
+          AND kcu.REFERENCED_TABLE_SCHEMA = DATABASE()
+          AND kcu.REFERENCED_TABLE_NAME IN ({placeholders})
+          AND rc.UPDATE_RULE = 'CASCADE'
+        ORDER BY kcu.REFERENCED_TABLE_NAME, kcu.TABLE_NAME
+        """,
+        [*ordered_tables, *ordered_tables],
+    )
+    return tuple((str(parent), str(child)) for parent, child in cursor.fetchall())
+
+
+def order_tables_parent_first(
+    tables: Iterable[str], dependencies: Iterable[tuple[str, str]]
+) -> tuple[str, ...]:
+    """Topologically order tables so a cascading parent is updated first."""
+    remaining = set(tables)
+    dependencies = tuple(
+        (parent, child)
+        for parent, child in dependencies
+        if parent in remaining and child in remaining and parent != child
+    )
+    ordered: list[str] = []
+    while remaining:
+        children_with_pending_parent = {
+            child
+            for parent, child in dependencies
+            if parent in remaining and child in remaining
+        }
+        ready = sorted(remaining - children_with_pending_parent)
+        if not ready:
+            raise RuntimeError(
+                "Không thể xác định thứ tự update do vòng lặp foreign key: "
+                + ", ".join(sorted(remaining))
+            )
+        ordered.extend(ready)
+        remaining.difference_update(ready)
+    return tuple(ordered)
+
+
 def execute_plan(cursor, plan: MergePlan) -> dict[str, int]:
     columns_by_table: dict[str, set[str]] = defaultdict(set)
     for reference in plan.references:
         columns_by_table[reference.table].add(reference.column)
 
+    dependencies = discover_cascade_update_dependencies(cursor, tuple(columns_by_table))
+    table_order = order_tables_parent_first(columns_by_table, dependencies)
+    planned_updates = {
+        table: count_table_reference_rows(
+            cursor, table, sorted(columns), plan.source_id
+        )
+        for table, columns in columns_by_table.items()
+    }
+
     updated: dict[str, int] = {}
-    for table, columns in sorted(columns_by_table.items()):
-        updated[table] = update_table_references(
+    for table in table_order:
+        columns = columns_by_table[table]
+        update_table_references(
             cursor,
             table,
             sorted(columns),
             plan.source_id,
             plan.target_id,
         )
+        updated[table] = planned_updates[table]
 
     remaining: dict[str, int] = {}
     for table, columns in sorted(columns_by_table.items()):
@@ -702,6 +805,7 @@ def write_report(
     references = workbook.create_sheet("References")
     unique_checks = workbook.create_sheet("Unique checks")
     unreviewed = workbook.create_sheet("Unreviewed")
+    ignored_snapshots = workbook.create_sheet("Ignored snapshots")
     source_rows = workbook.create_sheet("Source rows")
 
     header_fill = PatternFill("solid", fgColor="1F4E78")
@@ -756,6 +860,12 @@ def write_report(
         ("Target project ID", plan.target_id),
         ("Reviewed reference columns", len(plan.references)),
         ("Source reference rows by column", plan.source_reference_rows),
+        ("Project differences (information only)", len(plan.project_differences)),
+        ("Ignored snapshot columns", len(plan.ignored_snapshots)),
+        (
+            "Ignored snapshot source rows",
+            sum(candidate.source_rows for candidate in plan.ignored_snapshots),
+        ),
         ("Blocking issues", len(plan.blockers)),
         ("Captured source rows", sum(len(item.rows) for item in plan.snapshots)),
         (
@@ -765,7 +875,9 @@ def write_report(
     ]
     if updated_counts is not None:
         metadata.append(("Updated rows", sum(updated_counts.values())))
-        metadata.append(("Deleted source project rows", 1 if status == "COMMITTED" else 0))
+        metadata.append(
+            ("Deleted source project rows", 1 if status == "COMMITTED" else 0)
+        )
     if error:
         metadata.append(("Error", error))
     for key, value in metadata:
@@ -794,7 +906,12 @@ def write_report(
         target_value = plan.target_project.get(column)
         append(
             projects,
-            [column, source_value, target_value, "YES" if source_value == target_value else "NO"],
+            [
+                column,
+                source_value,
+                target_value,
+                "YES" if source_value == target_value else "NO",
+            ],
         )
 
     append(
@@ -811,7 +928,9 @@ def write_report(
     )
     updated_counts = updated_counts or {}
     for reference in plan.references:
-        result = "UPDATED" if status == "COMMITTED" and reference.source_rows else status
+        result = (
+            "UPDATED" if status == "COMMITTED" and reference.source_rows else status
+        )
         append(
             references,
             [
@@ -836,7 +955,9 @@ def write_report(
                 check.table,
                 check.index,
                 ", ".join(check.columns),
-                check.conflict_groups if check.conflict_groups is not None else "NOT CHECKED",
+                check.conflict_groups
+                if check.conflict_groups is not None
+                else "NOT CHECKED",
                 check.note,
             ],
         )
@@ -850,6 +971,22 @@ def write_report(
                 candidate.column,
                 candidate.source_rows,
                 "BLOCKED" if candidate.source_rows else "NO SOURCE ROWS",
+            ],
+        )
+
+    append(
+        ignored_snapshots,
+        ["Table", "Column", "Source rows", "Planned action", "Reason"],
+    )
+    for candidate in plan.ignored_snapshots:
+        append(
+            ignored_snapshots,
+            [
+                candidate.table,
+                candidate.column,
+                candidate.source_rows,
+                "KEEP UNCHANGED",
+                "Reviewed backup/recovery snapshot",
             ],
         )
 
@@ -882,7 +1019,14 @@ def write_report(
                 ],
             )
 
-    for sheet in (projects, references, unique_checks, unreviewed, source_rows):
+    for sheet in (
+        projects,
+        references,
+        unique_checks,
+        unreviewed,
+        ignored_snapshots,
+        source_rows,
+    ):
         finish(sheet)
     source_rows.column_dimensions["C"].width = 100
 
@@ -902,6 +1046,14 @@ def print_plan(plan: MergePlan, database: str, host: str, report_path: Path) -> 
                 f"source={reference.source_rows}, target={reference.target_rows}, "
                 f"via={','.join(reference.sources)}"
             )
+    if plan.ignored_snapshots:
+        print("Ignored snapshots (kept unchanged):")
+        for candidate in plan.ignored_snapshots:
+            if candidate.source_rows:
+                print(
+                    f"- {candidate.table}.{candidate.column}: "
+                    f"source={candidate.source_rows}, action=KEEP UNCHANGED"
+                )
     if plan.blockers:
         print("Blocking issues:")
         for blocker in plan.blockers:
@@ -934,6 +1086,18 @@ def run_self_checks() -> None:
     assert make_placeholders([1, 2, 3]) == "%s, %s, %s"
     assert quote_identifier("project_info_id") == "`project_info_id`"
     assert safe_excel_value("=danger") == "'=danger"
+    assert order_tables_parent_first(
+        {"project_parameter_attachments", "project_r_parameter", "temp_data"},
+        {("project_r_parameter", "project_parameter_attachments")},
+    ) == ("project_r_parameter", "temp_data", "project_parameter_attachments")
+    try:
+        order_tables_parent_first(
+            {"parent", "child"}, {("parent", "child"), ("child", "parent")}
+        )
+    except RuntimeError:
+        pass
+    else:  # pragma: no cover - executable assertion
+        raise AssertionError("Cyclic update dependencies were accepted")
     matching_plan = MergePlan(
         source_id=1014,
         target_id=1000,
@@ -954,8 +1118,9 @@ def run_self_checks() -> None:
         references=(),
         unique_checks=(UniqueCheck("child", "uniq", ("project_id",), 1),),
         unreviewed_candidates=(Candidate("unknown", "project_id", 2),),
+        ignored_snapshots=(Candidate("backup", "project_id", 3),),
     )
-    assert len(blocked_plan.blockers) == 3
+    assert len(blocked_plan.blockers) == 2
     for invalid in (0, -1, True, "x"):
         try:
             normalize_positive_id(invalid, label="id")
@@ -1035,7 +1200,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("BLOCKED: không có dữ liệu nào bị thay đổi.")
         return 2
     if not args.execute:
-        print("PREVIEW: không có dữ liệu nào bị thay đổi. Review Excel trước khi execute.")
+        print(
+            "PREVIEW: không có dữ liệu nào bị thay đổi. Review Excel trước khi execute."
+        )
         return 0
 
     confirmation = f"MERGE_PROJECT_ID {database}:{source_id}->{target_id}"
