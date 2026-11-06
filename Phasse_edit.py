@@ -43,6 +43,7 @@ RUN_ASSUME_YES = False
 
 # Reviewed legacy project columns that may not have a direct project_info FK.
 # Never infer safety merely from a column being named project_id.
+# Attachment and manager-approval rows follow project_r_parameter via ON UPDATE CASCADE.
 LEGACY_PROJECT_COLUMNS: dict[str, tuple[str, ...]] = {
     "column_resized_tbl": ("project_info_id",),
     "detail_data": ("project_id",),
@@ -69,6 +70,12 @@ LEGACY_PROJECT_COLUMNS: dict[str, tuple[str, ...]] = {
     "test_project_senario_parameter": ("project_id",),
     "test_senario_parameter_map_relation": ("project_id",),
     "wp_statement": ("project_id",),
+    "project_r_parameter_history": ("project_id",),
+    "project_se_confirmation_history": ("project_id",),
+    "project_se_input_completion": ("project_id",),
+    "project_se_notification_target": ("project_id",),
+    "studies_comparison_dashboard_settings": ("project_id",),
+    "temp_project_parameter": ("project_id",),
 }
 
 IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9_$]+$")

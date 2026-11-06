@@ -35,12 +35,21 @@ LEGACY_PROJECT_TABLES = {
     "prj_rfl",
     "project_scenario_parameter",
     "project_r_parameter_history",
+    "project_r_parameter_manager_approval_history",
+    "studies_comparison_dashboard_settings",
+    "temp_project_parameter",
     "project_se_notification",
     "project_se_notification_target",
     "project_se_input_completion",
     "project_se_confirmation_history",
     "study_id_note",
     "study_group",
+}
+# Recovery snapshots keep their original IDs and are outside a project copy.
+SNAPSHOT_TABLES = {
+    "bk_prj_rfl_20260901", "bk_project_parameter_20260901",
+    "bk_project_r_parameter_20260901", "bk_test_project_senario_parameter_20260901",
+    "zz_oos_pp", "zz_oos_prp", "zz_oos_rfl", "zz_oos_tsp",
 }
 # (child, child columns, parent, parent columns, copy children with selected parent)
 LEGACY_RELATIONS = [
@@ -426,7 +435,7 @@ class CopyPlan:
         found_scope = False
         for table in sorted(self.tables):
             columns = self.scope(table)
-            if not columns:
+            if not columns or table in SNAPSHOT_TABLES:
                 continue
             reviewed = table in LEGACY_PROJECT_TABLES or all(
                 any(

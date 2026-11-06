@@ -37,6 +37,11 @@ from openpyxl import Workbook  # noqa: E402
 from openpyxl.styles import Alignment, Font, PatternFill  # noqa: E402
 from openpyxl.utils import get_column_letter  # noqa: E402
 
+if __package__:
+    from . import update_old_r_parameter_id_to_new_r_parameter_id as remap_core
+else:
+    import update_old_r_parameter_id_to_new_r_parameter_id as remap_core
+
 # PyCharm Run configuration. Preview first, then review the Excel report.
 RUN_R_PARAMETER_IDS = [
     123123367,
@@ -59,6 +64,7 @@ ROOT_COLUMN = "id"
 # Never add every column named r_parameter_id automatically.
 LEGACY_RELATIONSHIPS = (
     ("detail_data_rlist", "r_parameter_id", ROOT_TABLE, ROOT_COLUMN),
+    ("project_r_parameter_history", "r_parameter_id", ROOT_TABLE, ROOT_COLUMN),
 )
 
 # These DB rows can point to resources outside MySQL. The script never deletes
@@ -569,8 +575,39 @@ def fetch_snapshot(
     return TableSnapshot(table_name, action, columns, rows, total_rows)
 
 
+def count_scenario_references(cursor, ids: Sequence[int], *, lock_rows: bool = False) -> int:
+    scenario_key = ("test_senario_list_parameter", "rflid")
+    columns = fetch_existing_columns(cursor, [scenario_key])
+    if scenario_key not in columns:
+        return 0
+    if ("test_senario_list_parameter", "rflcategory") not in columns:
+        raise RuntimeError("Thiếu rflcategory để phân biệt liên kết R/F/L của Scenario Master.")
+    lock_clause = " FOR UPDATE" if lock_rows else ""
+    cursor.execute(
+        f"SELECT id FROM test_senario_list_parameter WHERE rflcategory = %s "
+        f"AND rflid IN ({make_placeholders(ids)}){lock_clause}",
+        ["R", *ids],
+    )
+    return len(cursor.fetchall())
+
+
+def plan_order_cleanup(
+    cursor, plan: DeletionPlan, ids: Sequence[int], *, lock_rows: bool = False
+) -> tuple[remap_core.MasterListChange, ...]:
+    rfl_ids = []
+    if "rfl" in plan.delete_paths:
+        where_sql, params = build_table_filter(plan.delete_paths["rfl"], ids)
+        cursor.execute(f"SELECT id FROM rfl AS target_row WHERE {where_sql}", params)
+        rfl_ids = [int(row[0]) for row in cursor.fetchall()]
+    return remap_core.build_master_list_changes(
+        cursor, [(value, None) for value in rfl_ids],
+        [(value, None) for value in ids], lock_rows=lock_rows,
+    )
+
+
 def collect_snapshots(
-    cursor, config: RunConfig, plan: DeletionPlan
+    cursor, config: RunConfig, plan: DeletionPlan,
+    order_changes: Sequence[remap_core.MasterListChange],
 ) -> list[TableSnapshot]:
     snapshots = [
         fetch_snapshot(
@@ -595,6 +632,16 @@ def collect_snapshots(
         for table_name in sorted(plan.set_null_paths)
         if table_name not in plan.delete_paths
     )
+    if order_changes:
+        snapshots.append(TableSnapshot(
+            "master_list_order", "UPDATE ORDER", ["id", "before", "after"],
+            [(change.row_id, change.old_json, change.new_json)
+             for change in order_changes[:config.report_row_limit]],
+            len(order_changes),
+        ))
+    scenario_count = count_scenario_references(cursor, config.r_parameter_ids)
+    if scenario_count:
+        snapshots.append(TableSnapshot("test_senario_list_parameter", "BLOCK", [], [], scenario_count))
     return snapshots
 
 
@@ -602,10 +649,13 @@ def delete_rows(
     config: RunConfig,
     plan: DeletionPlan,
     before_counts: dict[str, int],
+    order_changes: Sequence[remap_core.MasterListChange],
 ) -> tuple[dict[str, int], dict[str, int]]:
     deleted_counts: dict[str, int] = {}
     with transaction.atomic():
         with connection.cursor() as cursor:
+            if count_scenario_references(cursor, config.r_parameter_ids, lock_rows=True):
+                raise RuntimeError("Scenario Master còn tham chiếu R parameter. Hãy remap trước khi xóa.")
             current_counts = {
                 table_name: count_rows_for_paths(
                     cursor,
@@ -620,6 +670,10 @@ def delete_rows(
                     "Dữ liệu đã thay đổi sau preview; hủy xóa. "
                     f"Preview={before_counts}, hiện tại={current_counts}."
                 )
+
+            if plan_order_cleanup(cursor, plan, config.r_parameter_ids, lock_rows=True) != order_changes:
+                raise RuntimeError("Thứ tự R-list/RFL đã thay đổi sau preview; hủy xóa.")
+            remap_core.execute_master_list_changes(cursor, order_changes)
 
             for table_name in plan.delete_order:
                 where_sql, params = build_table_filter(
@@ -810,7 +864,8 @@ def write_report(
                 None if after_counts is None else after_counts.get(table_name),
                 len(snapshot.rows),
                 snapshot.truncated,
-                EXTERNAL_RESOURCE_TABLES.get(table_name, ""),
+                "Scenario Master còn tham chiếu; hãy remap trước khi xóa."
+                if snapshot.action == "BLOCK" else EXTERNAL_RESOURCE_TABLES.get(table_name, ""),
             ]
         )
     style_table_sheet(count_sheet)
@@ -884,7 +939,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             validate_all_ids_exist(config.r_parameter_ids, root_columns, root_rows)
             relations = add_legacy_relationships(cursor, discover_foreign_keys(cursor))
             plan = build_deletion_plan(relations)
-            snapshots = collect_snapshots(cursor, config, plan)
+            order_changes = plan_order_cleanup(cursor, plan, config.r_parameter_ids)
+            snapshots = collect_snapshots(cursor, config, plan, order_changes)
 
         before_counts = {
             item.table_name: item.total_rows
@@ -897,6 +953,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             if item.table_name in EXTERNAL_RESOURCE_TABLES and item.total_rows > 0
         }
 
+        scenario_count = next((item.total_rows for item in snapshots if item.action == "BLOCK"), 0)
         print_separator()
         print("XEM TRƯỚC XÓA R PARAMETER")
         print_separator()
@@ -917,6 +974,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
         print(f"Tổng dòng DELETE : {sum(before_counts.values())}")
 
+        if order_changes:
+            print(f"master_list_order: {len(order_changes)} dòng sẽ được cập nhật.")
+        if scenario_count:
+            print(f"Scenario Master: {scenario_count} liên kết R sẽ chặn xóa.")
         preview_message = "Đã xem trước; chưa xóa dữ liệu."
         if external_impacts:
             preview_message += " Tài nguyên ngoài DB: " + ", ".join(
@@ -962,6 +1023,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 1
 
         expected_confirmation = confirmation_text(config, database_name)
+        if scenario_count:
+            raise RuntimeError("Scenario Master còn tham chiếu R parameter. Hãy remap trước khi xóa.")
+
         if not config.assume_yes:
             print_separator()
             print("Để xác nhận xóa, nhập chính xác nội dung sau:")
@@ -982,7 +1046,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print("Đã hủy. Không có dữ liệu nào bị xóa.")
                 return 0
 
-        deleted_counts, after_counts = delete_rows(config, plan, before_counts)
+        deleted_counts, after_counts = delete_rows(config, plan, before_counts, order_changes)
         mutation_committed = True
         write_report(
             config,

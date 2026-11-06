@@ -31,17 +31,30 @@ if __name__ == "__main__":
 
 from django.db import connection  # noqa: E402
 
-from utils.Tools_new.se_master_get_data import (  # noqa: E402
-    LookupResult,
-    ReferenceCatalog,
-    RunResult,
-    _set_result_cell,
-    database_identity,
-    find_header_columns,
-    find_or_add_output_column,
-    normalize_match_key,
-    resolve_se_parameter,
-)
+if __package__:
+    from .se_master_get_data import (
+        LookupResult,
+        ReferenceCatalog,
+        RunResult,
+        _set_result_cell,
+        database_identity,
+        find_header_columns,
+        find_or_add_output_column,
+        normalize_match_key,
+        resolve_se_parameter,
+    )
+else:
+    from se_master_get_data import (
+        LookupResult,
+        ReferenceCatalog,
+        RunResult,
+        _set_result_cell,
+        database_identity,
+        find_header_columns,
+        find_or_add_output_column,
+        normalize_match_key,
+        resolve_se_parameter,
+    )
 
 # PyCharm Run-button configuration. There is intentionally no hierarchy ID.
 RUN_EXCEL_PATH = Path("/Users/TrongKieu/Downloads/seリストへの追加.xlsx")

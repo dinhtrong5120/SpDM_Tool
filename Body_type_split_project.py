@@ -32,6 +32,11 @@ if __name__ == "__main__":
 
 from django.db import connection, transaction  # noqa: E402
 
+if __package__:
+    from . import update_old_r_parameter_id_to_new_r_parameter_id as remap_core
+else:
+    import update_old_r_parameter_id_to_new_r_parameter_id as remap_core
+
 # PyCharm Run-button configuration for splitting one phase to a new project.
 RUN_PROJECT_BODY_TYPE_RULES = [
     {
@@ -62,6 +67,8 @@ MUTATION_TABLES = (
     "prj_rfl",
     "detail_data_rfl",
     "detail_data_to",
+    "wp_history",
+    "master_list_order",
     "operational_state",
 )
 INSERT_TABLES = (
@@ -71,16 +78,18 @@ INSERT_TABLES = (
     "l_r_relation",
     "rfl",
 )
-UPDATE_TABLES = (
-    "prj_rfl",
-    "detail_data_rfl",
-    "detail_data_to",
-    "operational_state",
+RFL_REFERENCE_COLUMNS = (
+    ("prj_rfl", "project_info_id"),
+    ("detail_data_rfl", "project_id"),
+    ("detail_data_to", "project_id"),
+    ("wp_history", "project_id"),
 )
+UPDATE_TABLES = (*[table for table, _ in RFL_REFERENCE_COLUMNS], "operational_state")
 ADVISORY_LOCK_TIMEOUT_SECONDS = 10
 
 # Reviewed legacy project columns. Entries are considered only when the table
 # also has phase_id; actual tables/columns are verified through information_schema.
+# Attachment and manager-approval rows follow project_r_parameter via ON UPDATE CASCADE.
 LEGACY_PROJECT_COLUMNS: dict[str, tuple[str, ...]] = {
     "column_resized_tbl": ("project_info_id",),
     "detail_data": ("project_id",),
@@ -107,6 +116,12 @@ LEGACY_PROJECT_COLUMNS: dict[str, tuple[str, ...]] = {
     "test_project_senario_parameter": ("project_id",),
     "test_senario_parameter_map_relation": ("project_id",),
     "wp_statement": ("project_id",),
+    "project_r_parameter_history": ("project_id",),
+    "project_se_confirmation_history": ("project_id",),
+    "project_se_input_completion": ("project_id",),
+    "project_se_notification_target": ("project_id",),
+    "studies_comparison_dashboard_settings": ("project_id",),
+    "temp_project_parameter": ("project_id",),
 }
 IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9_$]+$")
 
@@ -603,11 +618,7 @@ def estimate_update_counts(
     if target_setup_id == old_setup_id:
         counts.update({table: 0 for table in UPDATE_TABLES[:-1]})
     else:
-        for table, project_column in (
-            ("prj_rfl", "project_info_id"),
-            ("detail_data_rfl", "project_id"),
-            ("detail_data_to", "project_id"),
-        ):
+        for table, project_column in RFL_REFERENCE_COLUMNS:
             cursor.execute(
                 f"""
                 SELECT COUNT(*)
@@ -726,6 +737,8 @@ def print_plan(db_connection, plan: Sequence[Mapping[str, object]]) -> None:
         print("  Estimated UPDATE rows:")
         for table in UPDATE_TABLES:
             print(f"    {table}: {item['estimated_updates'][table]}")
+        if item["estimated_phase_moves"].get(("project_se_notification_target", "project_id"), 0):
+            print("  BLOCK: SE notification header cần được xử lý cùng các target của phase.")
         print("  Estimated phase rows moved to the new project:")
         nonzero_moves = [
             (key, count)
@@ -960,11 +973,7 @@ def update_rfl_references(
     cursor, project_id: int, phase_id: int, rfl_map: Mapping[int, int]
 ) -> dict[str, int]:
     counts: dict[str, int] = {}
-    for table_name, project_column in (
-        ("prj_rfl", "project_info_id"),
-        ("detail_data_rfl", "project_id"),
-        ("detail_data_to", "project_id"),
-    ):
+    for table_name, project_column in RFL_REFERENCE_COLUMNS:
         updated = 0
         for old_id, new_id in rfl_map.items():
             if old_id == new_id:
@@ -987,6 +996,12 @@ def update_rfl_references(
                 )
             updated += int(cursor.rowcount)
         counts[table_name] = updated
+    order_changes = remap_core.build_master_list_changes(
+        cursor, [(old_id, new_id) for old_id, new_id in rfl_map.items() if old_id != new_id],
+        (), lock_rows=True, rfl_scope=(project_id, phase_id),
+    )
+    remap_core.execute_master_list_changes(cursor, order_changes)
+    counts["master_list_order"] = len(order_changes)
     return counts
 
 
@@ -1076,6 +1091,11 @@ def move_phase_rows_to_new_project(
     new_project_id = int(assignment["new_project_id"])
     phase_id = int(assignment["phase_id"])
     expected_counts = assignment["estimated_phase_moves"]
+    if expected_counts.get(("project_se_notification_target", "project_id"), 0):
+        raise RuntimeError(
+            "Phase có thông báo SE. Cần tách notification header và target cùng lúc "
+            "để giữ đúng project của các phase còn lại."
+        )
     moved: dict[tuple[str, str], int] = {}
     for table in assignment["phase_tables"]:
         table_name = str(table["table_name"])
@@ -1151,6 +1171,7 @@ def print_actual_counts(
     print("  UPDATE rows:")
     for table in UPDATE_TABLES:
         print(f"    {table}: {counts[table]}")
+    print(f"    master_list_order: {counts['master_list_order']}")
     print("  Phase rows moved:")
     for (table_name, project_column), count in counts["phase_moves"].items():
         if count:

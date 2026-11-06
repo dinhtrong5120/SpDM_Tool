@@ -41,6 +41,8 @@ IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9_$]+$")
 LEGACY_R_PARAMETER_COLUMNS = frozenset(
     {
         ("detail_data_rlist", "r_parameter_id"),
+        ("project_r_parameter_history", "r_parameter_id"),
+        ("test_senario_list_parameter", "rflid"),
     }
 )
 REFERENCE_EXCLUSIONS = {
@@ -162,18 +164,6 @@ def normalize_id_mapping(
     return tuple(normalized_old), normalized_new
 
 
-def replace_integer_ids(value: Any, id_map: Mapping[int, int]) -> Any:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, int):
-        return id_map.get(value, value)
-    if isinstance(value, list):
-        return [replace_integer_ids(item, id_map) for item in value]
-    if isinstance(value, dict):
-        return {key: replace_integer_ids(item, id_map) for key, item in value.items()}
-    return value
-
-
 def database_identity() -> tuple[str, str]:
     settings_dict = connection.settings_dict
     return (
@@ -192,6 +182,7 @@ def discover_references(cursor: Any, referenced_table: str) -> tuple[Reference, 
          AND tables_meta.TABLE_NAME = kcu.TABLE_NAME
          AND tables_meta.TABLE_TYPE = 'BASE TABLE'
         WHERE kcu.TABLE_SCHEMA = DATABASE()
+          AND kcu.REFERENCED_TABLE_SCHEMA = DATABASE()
           AND kcu.REFERENCED_TABLE_NAME = %s
           AND kcu.REFERENCED_COLUMN_NAME = 'id'
         ORDER BY kcu.TABLE_NAME, kcu.COLUMN_NAME
@@ -243,6 +234,13 @@ def discover_unique_indexes(
     )
 
 
+def reference_scope(reference: Reference) -> str:
+    # rflid names an R, F or L master ID depending on rflcategory.
+    if reference == Reference("test_senario_list_parameter", "rflid"):
+        return " AND rflcategory = 'R'"
+    return ""
+
+
 def select_reference_values(
     cursor: Any,
     reference: Reference,
@@ -258,7 +256,7 @@ def select_reference_values(
     lock_clause = " FOR UPDATE" if lock_rows else ""
     cursor.execute(
         f"SELECT {', '.join(selected_columns)} FROM {table} "
-        f"WHERE {column} IN ({placeholders}){lock_clause}",
+        f"WHERE {column} IN ({placeholders}){reference_scope(reference)}{lock_clause}",
         list(values),
     )
     return list(cursor.fetchall())
@@ -318,13 +316,13 @@ def build_reference_plan(
     for old_id, _new_id in mappings:
         if lock_rows:
             cursor.execute(
-                f"SELECT {column} FROM {table} WHERE {column} = %s{lock_clause}",
+                f"SELECT {column} FROM {table} WHERE {column} = %s{reference_scope(reference)}{lock_clause}",
                 [old_id],
             )
             row_counts.append(len(cursor.fetchall()))
         else:
             cursor.execute(
-                f"SELECT COUNT(*) FROM {table} WHERE {column} = %s",
+                f"SELECT COUNT(*) FROM {table} WHERE {column} = %s{reference_scope(reference)}",
                 [old_id],
             )
             row_counts.append(int(cursor.fetchone()[0]))
@@ -333,6 +331,14 @@ def build_reference_plan(
         if check_unique and any(row_counts)
         else ()
     )
+    if reference_scope(reference) and any(row_counts):
+        mapping = dict(mappings)
+        values = tuple(dict.fromkeys([*mapping, *mapping.values()]))
+        active_ids = {
+            int(row[0]) for row in select_reference_values(cursor, reference, values, lock_rows=lock_rows)
+        }
+        if len({mapping.get(value, value) for value in active_ids}) != len(active_ids):
+            unique_conflicts += ("Scenario Master đã có liên kết R cho cả ID nguồn và ID đích.",)
     return ReferencePlan(
         reference=reference,
         mappings=tuple(mappings),
@@ -526,26 +532,55 @@ def build_l_r_relation_plan(
 
 def build_master_list_changes(
     cursor: Any,
-    rfl_merges: Sequence[tuple[int, int]],
+    rfl_merges: Sequence[tuple[int, int | None]],
+    r_parameter_merges: Sequence[tuple[int, int | None]],
     *,
     lock_rows: bool,
+    rfl_scope: tuple[int, int] | None = None,
 ) -> tuple[MasterListChange, ...]:
-    if not rfl_merges:
+    if not rfl_merges and not r_parameter_merges:
         return ()
+    scope_filter = "" if rfl_scope is None else " AND o.project_id = %s AND o.phase_id = %s"
     lock_clause = " FOR UPDATE" if lock_rows else ""
     cursor.execute(
-        f"SELECT id, list_order FROM master_list_order ORDER BY id{lock_clause}"
+        f"""
+        SELECT id, list_order FROM master_list_order AS m
+        WHERE id = 2 OR (id <> 1 AND EXISTS (
+            SELECT 1 FROM rfl_order AS o WHERE o.order_id = m.id{scope_filter}
+        ))
+        ORDER BY id{lock_clause}
+        """,
+        rfl_scope or (),
     )
-    id_map = dict(rfl_merges)
+    rfl_id_map = dict(rfl_merges)
+    r_parameter_id_map = dict(r_parameter_merges)
     changes: list[MasterListChange] = []
     for row_id, raw_value in cursor.fetchall():
         parsed = json.loads(raw_value) if isinstance(raw_value, str) else raw_value
-        replaced = replace_integer_ids(parsed, id_map)
+        id_map = r_parameter_id_map if int(row_id) == 2 else rfl_id_map
+        if not id_map:
+            continue
+        if not isinstance(parsed, list) or any(type(value) is not int for value in parsed):
+            raise RuntimeError(f"Unexpected list_order format in master_list_order.id={row_id}.")
+        replaced = [new_id for value in parsed if (new_id := id_map.get(value, value)) is not None]
         if replaced == parsed:
             continue
+        if any(new_id is not None for new_id in id_map.values()):
+            replaced = list(dict.fromkeys(replaced))
         old_json = json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
         new_json = json.dumps(replaced, ensure_ascii=False, separators=(",", ":"))
         changes.append(MasterListChange(int(row_id), old_json, new_json))
+    if rfl_scope is not None:
+        changed_orders = [change.row_id for change in changes if change.row_id != 2]
+        if changed_orders:
+            cursor.execute(
+                f"SELECT DISTINCT order_id FROM rfl_order WHERE order_id IN ({make_placeholders(changed_orders)}) "
+                "AND NOT (project_id = %s AND phase_id = %s)",
+                [*changed_orders, *rfl_scope],
+            )
+            shared_orders = [row[0] for row in cursor.fetchall()]
+            if shared_orders:
+                raise RuntimeError(f"RFL order được dùng chung với project/phase khác: {shared_orders}")
     return tuple(changes)
 
 
@@ -595,9 +630,11 @@ def build_plan(
     lrr_deletes, lrr_updates = build_l_r_relation_plan(
         cursor, setup_merges, lock_rows=lock_rows
     )
-    master_changes = build_master_list_changes(cursor, rfl_merges, lock_rows=lock_rows)
-
     direct_mapping = tuple((old_id, new_id) for old_id in old_ids)
+    master_changes = build_master_list_changes(
+        cursor, rfl_merges, direct_mapping, lock_rows=lock_rows
+    )
+
     direct_plans: list[ReferencePlan] = []
     for reference in r_parameter_references:
         if (reference.table, reference.column) in REFERENCE_EXCLUSIONS["r_parameter"]:
@@ -738,7 +775,7 @@ def execute_reference_plan(cursor: Any, plan: ReferencePlan) -> None:
         if expected_count == 0:
             continue
         cursor.execute(
-            f"UPDATE {table} SET {column} = %s WHERE {column} = %s",
+            f"UPDATE {table} SET {column} = %s WHERE {column} = %s{reference_scope(plan.reference)}",
             [new_id, old_id],
         )
         if cursor.rowcount != expected_count:
@@ -755,6 +792,15 @@ def expect_row_count(cursor: Any, expected: int, action: str) -> None:
             f"Unexpected row count for {action}: got {cursor.rowcount}, "
             f"expected {expected}."
         )
+
+
+def execute_master_list_changes(cursor: Any, changes: Sequence[MasterListChange]) -> None:
+    for change in changes:
+        cursor.execute(
+            "UPDATE master_list_order SET list_order = %s WHERE id = %s",
+            [change.new_json, change.row_id],
+        )
+        expect_row_count(cursor, 1, "update master_list_order.list_order")
 
 
 def execute_plan(cursor: Any, plan: MigrationPlan) -> None:
@@ -783,12 +829,7 @@ def execute_plan(cursor: Any, plan: MigrationPlan) -> None:
         )
         expect_row_count(cursor, 1, "update prj_rfl.rfl_id")
 
-    for change in plan.master_list_changes:
-        cursor.execute(
-            "UPDATE master_list_order SET list_order = %s WHERE id = %s",
-            [change.new_json, change.row_id],
-        )
-        expect_row_count(cursor, 1, "update master_list_order.list_order")
+    execute_master_list_changes(cursor, plan.master_list_changes)
 
     for old_rfl_id, _new_rfl_id in plan.rfl_merges:
         cursor.execute("DELETE FROM rfl WHERE id = %s", [old_rfl_id])
@@ -845,7 +886,7 @@ def count_remaining_values(
     table = quote_identifier(reference.table)
     column = quote_identifier(reference.column)
     cursor.execute(
-        f"SELECT COUNT(*) FROM {table} WHERE {column} IN ({placeholders})",
+        f"SELECT COUNT(*) FROM {table} WHERE {column} IN ({placeholders}){reference_scope(reference)}",
         list(values),
     )
     return int(cursor.fetchone()[0])
@@ -880,6 +921,14 @@ def verify_result(cursor: Any, plan: MigrationPlan) -> None:
             raise RuntimeError(
                 "Post-update verification found duplicate old setup_r_relation rows."
             )
+
+
+    remaining_order_changes = build_master_list_changes(
+        cursor, plan.rfl_merges, tuple((old_id, plan.new_id) for old_id in plan.old_ids),
+        lock_rows=False,
+    )
+    if remaining_order_changes:
+        raise RuntimeError("Post-update verification found old IDs in scoped master_list_order rows.")
 
 
 def remap_r_parameter_ids(

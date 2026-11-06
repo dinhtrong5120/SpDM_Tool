@@ -43,7 +43,10 @@ def main() -> int:
     os.environ.setdefault("DJANGO_SETTINGS_MODULE", "backend.settings")
     django.setup()
 
-    from utils.Tools_new.Project_copy_r_parameter import copy_r_parameters
+    if __package__:
+        from .Project_copy_r_parameter import copy_r_parameters
+    else:
+        from Project_copy_r_parameter import copy_r_parameters
 
     return copy_r_parameters(
         RUN_SOURCE,

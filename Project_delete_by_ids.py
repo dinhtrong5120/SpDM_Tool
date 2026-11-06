@@ -66,6 +66,14 @@ LEGACY_PROJECT_COLUMNS: dict[str, tuple[str, ...]] = {
     "temp_project_parameter": ("project_id",),
 }
 
+# Exact parent keys used by the scenario APIs. Delete leaf rows before parents.
+LEGACY_PHASE_CHILDREN = {
+    "comments_table": (("study_group_statement", "statement_id"), ("study_group", "study_group_id")),
+    "statement_history": (("study_group", "study_group_id"),),
+    "study_group_statement": (("study_group", "study_group_id"),),
+    "detail_data_sim": (("test_project_senario_parameter", "id"),),
+}
+
 IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9_$]+$")
 
 
@@ -236,7 +244,7 @@ def get_phase_related_tables(cursor) -> list[dict[str, object]]:
         table_columns[table_name].update(columns)
         relation_types[table_name].add("legacy_allowlist")
 
-    return [
+    tables = [
         {
             "table_name": table_name,
             "project_columns": sorted(columns),
@@ -245,6 +253,38 @@ def get_phase_related_tables(cursor) -> list[dict[str, object]]:
         }
         for table_name, columns in sorted(table_columns.items())
     ]
+
+
+    base_tables = {str(item["table_name"]): item for item in tables}
+    cursor.execute(
+        """
+        SELECT c.TABLE_NAME, c.COLUMN_NAME
+        FROM information_schema.COLUMNS AS c
+        JOIN information_schema.TABLES AS t USING (TABLE_SCHEMA, TABLE_NAME)
+        WHERE c.TABLE_SCHEMA = DATABASE() AND t.TABLE_TYPE = 'BASE TABLE'
+          AND c.TABLE_NAME IN ('comments_table', 'statement_history', 'study_group_statement',
+                               'study_group', 'detail_data_sim', 'test_project_senario_parameter')
+        """
+    )
+    existing_columns: dict[str, set[str]] = defaultdict(set)
+    for name, column in cursor.fetchall():
+        existing_columns[name].add(column)
+    for child, path in LEGACY_PHASE_CHILDREN.items():
+        if child not in existing_columns or child in base_tables:
+            continue
+        root = base_tables.get(path[-1][0])
+        if root is None:
+            continue
+        current = child
+        for parent, child_column in path:
+            if child_column not in existing_columns[current] or "id" not in existing_columns[parent]:
+                raise RuntimeError(f"Quan hệ legacy không khớp schema: {current}.{child_column} -> {parent}.id")
+            current = parent
+        tables.append({
+            **root, "table_name": child, "scope_path": path,
+            "relation_types": ["legacy_indirect"],
+        })
+    return tables
 
 
 def get_project_usage_tables(cursor) -> list[dict[str, object]]:
@@ -336,6 +376,11 @@ def order_tables_child_first(
         if child_table != parent_table:
             children[parent_table].add(child_table)
 
+    for child_table, item in by_name.items():
+        path = item.get("scope_path")
+        if path:
+            children[path[0][0]].add(child_table)
+
     ordered_names: list[str] = []
     visiting: set[str] = set()
     visited: set[str] = set()
@@ -383,6 +428,25 @@ def build_target_filter(
         params.extend([project_id] * len(project_columns))
         params.append(phase_id)
     return " OR ".join(target_clauses), tuple(params)
+
+
+def build_table_target_filter(
+    item: dict[str, object], targets: Sequence[tuple[int, int]]
+) -> tuple[str, tuple[int, ...]]:
+    where_sql, params = build_target_filter(
+        list(item["project_columns"]), str(item["phase_column"]), targets
+    )
+    path = item.get("scope_path", ())
+    child_names = [str(item["table_name"]), *(parent for parent, _ in path)]
+    for index in range(len(path) - 1, -1, -1):
+        parent, child_column = path[index]
+        where_sql = (
+            f"EXISTS (SELECT 1 FROM {quote_identifier(parent)} "
+            f"WHERE {quote_identifier(parent)}.`id` = "
+            f"{quote_identifier(child_names[index])}.{quote_identifier(child_column)} "
+            f"AND ({where_sql}))"
+        )
+    return where_sql, params
 
 
 def build_project_filter(
@@ -433,11 +497,7 @@ def count_related_rows(
     counts: dict[str, int] = {}
     for item in related_tables:
         table_name = str(item["table_name"])
-        project_columns = list(item["project_columns"])
-        phase_column = str(item["phase_column"])
-        where_sql, params = build_target_filter(
-            project_columns, phase_column, targets
-        )
+        where_sql, params = build_table_target_filter(item, targets)
         cursor.execute(
             f"SELECT COUNT(*) FROM {quote_identifier(table_name)} "
             f"WHERE {where_sql}",
@@ -1006,11 +1066,7 @@ def delete_project_phase_data(
                 )
                 for item in related_tables:
                     table_name = str(item["table_name"])
-                    project_columns = list(item["project_columns"])
-                    phase_column = str(item["phase_column"])
-                    where_sql, params = build_target_filter(
-                        project_columns, phase_column, normalized_targets
-                    )
+                    where_sql, params = build_table_target_filter(item, normalized_targets)
                     cursor.execute(
                         f"SELECT COUNT(*) FROM {quote_identifier(table_name)} "
                         f"WHERE {where_sql} FOR UPDATE",

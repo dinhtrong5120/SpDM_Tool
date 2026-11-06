@@ -38,9 +38,10 @@ if __name__ == "__main__":
 
 from django.db import connection, transaction  # noqa: E402
 
-from utils.Tools_new import (  # noqa: E402
-    update_old_r_parameter_id_to_new_r_parameter_id as remap_core,
-)
+if __package__:
+    from . import update_old_r_parameter_id_to_new_r_parameter_id as remap_core
+else:
+    import update_old_r_parameter_id_to_new_r_parameter_id as remap_core
 
 # import pandas as pd  # noqa: E402
 #
@@ -759,6 +760,7 @@ def build_batch_plan(
     master_list_changes = remap_core.build_master_list_changes(
         cursor,
         rfl_mappings,
+        tuple(pair for group in groups for pair in group.mappings),
         lock_rows=lock_rows,
     )
     conflicts = tuple(
@@ -849,45 +851,6 @@ def require_batch_confirmation(
         raise RuntimeError("Confirmation did not match; nothing was changed.")
 
 
-def execute_master_list_changes(
-    cursor: Any, changes: Sequence[remap_core.MasterListChange]
-) -> None:
-    for change in changes:
-        cursor.execute(
-            "UPDATE master_list_order SET list_order = %s WHERE id = %s",
-            [change.new_json, change.row_id],
-        )
-        remap_core.expect_row_count(cursor, 1, "update master_list_order.list_order")
-
-
-def contains_integer_id(value: Any, ids: set[int]) -> bool:
-    if isinstance(value, bool):
-        return False
-    if isinstance(value, int):
-        return value in ids
-    if isinstance(value, list):
-        return any(contains_integer_id(item, ids) for item in value)
-    if isinstance(value, dict):
-        return any(contains_integer_id(item, ids) for item in value.values())
-    return False
-
-
-def verify_master_list_order(cursor: Any, old_rfl_ids: set[int]) -> None:
-    if not old_rfl_ids:
-        return
-    cursor.execute("SELECT id, list_order FROM master_list_order ORDER BY id")
-    remaining_rows: list[int] = []
-    for row_id, raw_value in cursor.fetchall():
-        parsed = json.loads(raw_value) if isinstance(raw_value, str) else raw_value
-        if contains_integer_id(parsed, old_rfl_ids):
-            remaining_rows.append(int(row_id))
-    if remaining_rows:
-        raise RuntimeError(
-            "Post-update verification found old RFL IDs in master_list_order "
-            f"rows: {remaining_rows}"
-        )
-
-
 def delete_replaced_parameter_rows(cursor: Any, old_ids: Sequence[int]) -> None:
     """Hard-delete verified source parameters and require an exact row count."""
     if not old_ids:
@@ -930,10 +893,9 @@ def execute_batch_plan(
         raise RuntimeError("Cannot execute a batch plan with unique-key conflicts.")
     for group_plan in plan.group_plans:
         remap_core.execute_plan(cursor, group_plan)
-    execute_master_list_changes(cursor, plan.master_list_changes)
+    remap_core.execute_master_list_changes(cursor, plan.master_list_changes)
     for group_plan in plan.group_plans:
         remap_core.verify_result(cursor, group_plan)
-    verify_master_list_order(cursor, set(plan.rfl_id_map))
     if delete_replaced_parameters:
         old_ids = replaced_parameter_ids(plan)
         delete_replaced_parameter_rows(cursor, old_ids)

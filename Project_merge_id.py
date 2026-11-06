@@ -85,9 +85,11 @@ IGNORED_SNAPSHOT_PROJECT_COLUMNS: dict[str, tuple[str, ...]] = {
     "bk_prj_rfl_20260901": ("project_info_id",),
     "bk_project_parameter_20260901": ("project_id",),
     "bk_project_r_parameter_20260901": ("project_id",),
+    "bk_test_project_senario_parameter_20260901": ("project_id",),
     "zz_oos_pp": ("project_id",),
     "zz_oos_prp": ("project_id",),
     "zz_oos_rfl": ("project_info_id",),
+    "zz_oos_tsp": ("project_id",),
 }
 
 CANDIDATE_COLUMN_NAMES = ("project_id", "project_info_id")

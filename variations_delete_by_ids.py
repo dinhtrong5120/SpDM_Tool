@@ -68,6 +68,16 @@ TARGET_TABLES = (
     "project_r_parameter",
 )
 
+# These rows share the variation scope without a composite FK to the deleted value.
+# Report them without widening this tool's four-table delete contract.
+LEGACY_RETAINED_TABLES = (
+    "project_r_parameter_history",
+    "project_se_confirmation_history",
+    "project_se_input_completion",
+    "project_se_notification_target",
+    "temp_project_parameter",
+)
+
 IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9_$]+$")
 EXCEL_ILLEGAL_CHARACTER_PATTERN = re.compile(r"[\x00-\x08\x0B-\x0C\x0E-\x1F]")
 EXCEL_CELL_LIMIT = 32_767
@@ -514,6 +524,23 @@ def fetch_related_impacts(
                 ),
             )
         )
+    existing = fetch_table_columns(cursor, LEGACY_RETAINED_TABLES)
+    for table_name in LEGACY_RETAINED_TABLES:
+        if table_name in related_tables or not required_columns <= existing[table_name]:
+            continue
+        cursor.execute(
+            f"SELECT COUNT(*) FROM {quote_identifier(table_name)} WHERE {where_sql}",
+            params,
+        )
+        impacts.append(RelatedImpact(
+            constraint_name="legacy_allowlist",
+            table_name=table_name,
+            parent_table="",
+            delete_rule="NO FK",
+            action="RETAIN",
+            row_count=int(cursor.fetchone()[0]),
+            note="Dữ liệu cùng scope, nằm ngoài bốn bảng được phép xóa.",
+        ))
     return impacts
 
 

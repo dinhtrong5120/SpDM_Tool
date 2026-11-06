@@ -33,8 +33,8 @@ RUN_TARGET_PROJECT_ID = 1054
 RUN_PHASE_ID = 16
 RUN_SOURCE_VARIATION_ID = 1000012
 RUN_TARGET_VARIATION_IDS = [1000014, 1000015]
-RUN_EXECUTE = True
-RUN_ASSUME_YES = True
+RUN_EXECUTE = False
+RUN_ASSUME_YES = False
 REPORT_DIR = PROJECT_ROOT / "utils" / "output"
 
 ReportRow = tuple[int, int, str | None, str | None, str | None, str]

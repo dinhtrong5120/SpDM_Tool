@@ -24,7 +24,10 @@ if __name__ == "__main__":
     os.environ.setdefault("DJANGO_SETTINGS_MODULE", "backend.settings")
     django.setup()
 
-from utils.Tools import Project_parameter_value_edit as base  # noqa: E402
+if __package__:
+    from . import Project_parameter_value_edit as base
+else:
+    import Project_parameter_value_edit as base
 
 # PyCharm Run-button configuration. Change these values in this file.
 RUN_PROJECT_ID = base.RUN_PROJECT_ID

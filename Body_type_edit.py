@@ -26,7 +26,10 @@ if __name__ == "__main__":
 
 from django.db import connection, transaction  # noqa: E402
 
-from utils.Tools import Body_type_split_project as core  # noqa: E402
+if __package__:
+    from . import Body_type_split_project as core
+else:
+    import Body_type_split_project as core
 
 # PyCharm Run-button configuration. Preview before changing RUN_EXECUTE.
 RUN_PROJECT_BODY_TYPE_RULES = [
@@ -55,6 +58,8 @@ MUTATION_TABLES = (
     "prj_rfl",
     "detail_data_rfl",
     "detail_data_to",
+    "wp_history",
+    "master_list_order",
     "operational_state",
 )
 INSERT_TABLES = core.INSERT_TABLES
@@ -291,6 +296,7 @@ def print_actual_counts(
     print("  UPDATE rows:")
     for table in UPDATE_TABLES:
         print(f"    {table}: {counts[table]}")
+    print(f"    master_list_order: {counts['master_list_order']}")
 
 
 def edit_project_body_types(
