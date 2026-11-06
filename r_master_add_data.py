@@ -33,7 +33,7 @@ from django.db import connection, transaction  # noqa: E402
 
 
 # PyCharm Run-button configuration. Always preview before enabling execution.
-RUN_EXCEL_FILE = "/Users/TrongKieu/Downloads/R_LIST_MASTER_項目追加.xlsx"
+RUN_EXCEL_FILE = "/Users/TrongKieu/Downloads/R_Masterへ登録する項目_20261105.xlsx"
 RUN_SHEET_NAME: str | int = 0
 RUN_OUTPUT_DIRECTORY: str | None = None
 RUN_DEFAULT_HIERARCHY: str | None = "車両"
@@ -278,7 +278,13 @@ def get_or_create_reference(
     if table_name not in REFERENCE_TABLES:
         raise ValueError(f"Unsupported reference table: {table_name}")
     if value is None:
-        return None, False
+        if table_name != "units":
+            return None, False
+        cursor.execute("SELECT MIN(id) FROM units WHERE unit IS NULL")
+        existing = cursor.fetchone()
+        if existing is None or existing[0] is None:
+            raise ValueError("No units record with unit IS NULL was found.")
+        return int(existing[0]), False
 
     if value in staged_values[table_name]:
         return staged_values[table_name][value], False
